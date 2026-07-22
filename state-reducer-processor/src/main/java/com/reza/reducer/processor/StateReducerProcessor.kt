@@ -1,0 +1,68 @@
+package com.reza.reducer.processor
+
+import com.google.devtools.ksp.processing.*
+import com.google.devtools.ksp.symbol.*
+import com.google.devtools.ksp.validate
+import com.squareup.kotlinpoet.*
+import com.squareup.kotlinpoet.ksp.toClassName
+import com.squareup.kotlinpoet.ksp.writeTo
+
+class StateReducerProcessor(
+    private val codeGenerator: CodeGenerator,
+    private val logger: KSPLogger
+) : SymbolProcessor {
+
+    override fun process(resolver: Resolver): List<KSAnnotated> {
+        val symbols = resolver.getSymbolsWithAnnotation("com.reza.reducer.annotations.GenerateUpdaters")
+        val unableToProcess = symbols.filterNot { it.validate() }.toList()
+
+        symbols
+            .filter { it is KSClassDeclaration && it.validate() }
+            .map { it as KSClassDeclaration }
+            .forEach { classDeclaration ->
+                // Ensure it's actually a data class
+                if (!classDeclaration.modifiers.contains(Modifier.DATA)) {
+                    logger.error("@GenerateUpdaters can only be applied to data classes", classDeclaration)
+                    return@forEach
+                }
+                generateUpdatersForClass(classDeclaration)
+            }
+
+        return unableToProcess
+    }
+
+    private fun generateUpdatersForClass(classDeclaration: KSClassDeclaration) {
+        val packageName = classDeclaration.packageName.asString()
+        val className = classDeclaration.simpleName.asString()
+        val classType = classDeclaration.toClassName()
+
+        // File building setup via KotlinPoet
+        val fileBuilder = FileSpec.builder(packageName, "${className}Updaters")
+
+        val properties = classDeclaration.getAllProperties()
+        for (property in properties) {
+            val propertyName = property.simpleName.asString()
+            val propertyType = property.type.resolve().toClassName()
+
+            // Build the lambda parameter type: (PropertyType) -> PropertyType
+            val lambdaParam = LambdaTypeName.get(
+                parameters = arrayOf(propertyType),
+                returnType = propertyType
+            )
+
+            val capitalizedName = propertyName.replaceFirstChar { it.uppercase() }
+
+            // Construct the extension function: fun TargetState.updatePropertyName(transform: (Prop) -> Prop): TargetState
+            val extensionFunction = FunSpec.builder("update$capitalizedName")
+                .receiver(classType)
+                .returns(classType)
+                .addParameter("transform", lambdaParam)
+                .addStatement("return this.copy(%L = transform(this.%L))", propertyName, propertyName)
+                .build()
+
+            fileBuilder.addFunction(extensionFunction)
+        }
+
+        fileBuilder.build().writeTo(codeGenerator, aggregating = false)
+    }
+}
